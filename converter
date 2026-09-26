@@ -1,0 +1,183 @@
+"""
+Core conversion logic: CBZ/ZIP and CBR/RAR (including multi-volume RAR
+sets) -> single PDF.
+
+Kept dependency-free of Telegram entirely, so it can be unit-tested or
+reused (e.g. from a CLI) without spinning up the bot.
+"""
+
+import logging
+import os
+import re
+import shutil
+import zipfile
+from pathlib import Path
+from typing import List, Optional
+
+import img2pdf
+import rarfile
+from PIL import Image, UnidentifiedImageError
+
+logger = logging.getLogger(__name__)
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+ZIP_EXTS = {".cbz", ".zip"}
+RAR_EXTS = {".cbr", ".rar"}
+
+# Matches the "volume suffix" of a split RAR archive, e.g.:
+#   Comic.part1.rar / Comic.part02.rar   -> group key "Comic"
+#   Comic.r00 / Comic.r01 / Comic.r99    -> group key "Comic"
+_PART_RAR_RE = re.compile(r"^(?P<base>.+)\.part(?P<num>\d+)\.rar$", re.IGNORECASE)
+_OLD_RAR_RE = re.compile(r"^(?P<base>.+)\.r(?P<num>\d{2,3})$", re.IGNORECASE)
+_FIRST_VOLUME_RE = re.compile(r"^(?P<base>.+)\.(cbr|rar)$", re.IGNORECASE)
+
+
+class ConversionError(Exception):
+    """Raised for any expected, user-facing conversion failure."""
+
+
+# --------------------------------------------------------------------------
+# Multi-volume archive detection
+# --------------------------------------------------------------------------
+
+def volume_group_key(filename: str) -> Optional[str]:
+    """
+    Returns a stable "group key" for any file that is part of a
+    multi-volume RAR set (so all its siblings can be collected together
+    before extraction), or None if the file is a complete, standalone
+    archive on its own.
+    """
+    m = _PART_RAR_RE.match(filename)
+    if m:
+        return m.group("base").lower()
+    m = _OLD_RAR_RE.match(filename)
+    if m:
+        return m.group("base").lower()
+    return None
+
+
+def is_first_volume(filename: str) -> bool:
+    """True for '<base>.part1.rar', '<base>.rar', or '<base>.cbr' (the
+    volume unrar should be pointed at to auto-discover the rest)."""
+    m = _PART_RAR_RE.match(filename)
+    if m:
+        return int(m.group("num")) == 1
+    if _OLD_RAR_RE.match(filename):
+        return False  # the .rXX scheme's first volume is the plain .rar/.cbr file
+    return bool(_FIRST_VOLUME_RE.match(filename))
+
+
+def is_archive_file(filename: str) -> bool:
+    ext = Path(filename).suffix.lower()
+    return ext in ZIP_EXTS or ext in RAR_EXTS or volume_group_key(filename) is not None
+
+
+# --------------------------------------------------------------------------
+# Extraction
+# --------------------------------------------------------------------------
+
+def _natural_key(path: Path):
+    """Sort '2.jpg' before '10.jpg' the way a human expects."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", path.name)]
+
+
+def _extract_zip(archive_path: str, extract_to: str) -> None:
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(extract_to)
+    except zipfile.BadZipFile as e:
+        raise ConversionError("This .cbz/.zip file is corrupted or not a valid ZIP archive.") from e
+
+
+def _extract_rar(archive_path: str, extract_to: str) -> None:
+    """
+    Extracts a RAR/CBR archive. If sibling volumes (.r00, .part2.rar, ...)
+    sit next to `archive_path` on disk, rarfile/unrar discovers and pulls
+    them in automatically -- that's the entire multi-volume story.
+    """
+    try:
+        with rarfile.RarFile(archive_path, "r") as rf:
+            rf.extractall(extract_to)
+    except rarfile.NeedFirstVolume as e:
+        raise ConversionError(
+            "This looks like a non-first volume of a split archive. Send /convert "
+            "only after all parts have been uploaded, or re-send the first volume."
+        ) from e
+    except rarfile.RarCannotExec as e:
+        raise ConversionError(
+            "The 'unrar' binary is missing on the server. It must be installed "
+            "in the Docker image (see the provided Dockerfile)."
+        ) from e
+    except rarfile.BadRarFile as e:
+        raise ConversionError(
+            "This .cbr/.rar file is corrupted, or a required volume is missing."
+        ) from e
+
+
+def extract_archive(archive_path: str, extract_to: str) -> None:
+    os.makedirs(extract_to, exist_ok=True)
+    ext = Path(archive_path).suffix.lower()
+    if ext in ZIP_EXTS:
+        _extract_zip(archive_path, extract_to)
+    elif ext in RAR_EXTS:
+        _extract_rar(archive_path, extract_to)
+    else:
+        raise ConversionError(f"Unsupported archive extension: {ext}")
+
+
+def collect_images(folder: str) -> List[Path]:
+    images = [p for p in Path(folder).rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    images.sort(key=_natural_key)
+    if not images:
+        raise ConversionError("No readable images were found inside the archive.")
+    return images
+
+
+def _sanitize_images(images: List[Path], work_dir: str) -> List[str]:
+    """
+    Normalizes every page to a JPEG img2pdf can always consume.
+    Protects against CMYK scans, palette/GIF frames, broken EXIF, etc.
+    Unreadable pages are skipped rather than failing the whole book.
+    """
+    clean_dir = os.path.join(work_dir, "_clean")
+    os.makedirs(clean_dir, exist_ok=True)
+    clean_paths: List[str] = []
+
+    for i, img_path in enumerate(images):
+        try:
+            with Image.open(img_path) as im:
+                im.load()
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                out_path = os.path.join(clean_dir, f"{i:05d}.jpg")
+                im.save(out_path, "JPEG", quality=92)
+                clean_paths.append(out_path)
+        except (UnidentifiedImageError, OSError) as e:
+            logger.warning("Skipping unreadable page %s: %s", img_path, e)
+
+    if not clean_paths:
+        raise ConversionError("All images inside the archive failed to decode.")
+    return clean_paths
+
+
+def convert_to_pdf(archive_path: str, work_dir: str, output_pdf_path: str) -> str:
+    """
+    Extracts a CBZ/CBR/ZIP/RAR (including multi-volume RAR, as long as
+    every part sits alongside `archive_path` on disk) and compiles its
+    pages into a single PDF at `output_pdf_path`. Intermediate files are
+    always cleaned up, even on failure. Returns the output path.
+    """
+    extract_dir = os.path.join(work_dir, "extracted")
+    try:
+        extract_archive(archive_path, extract_dir)
+        images = collect_images(extract_dir)
+        clean_images = _sanitize_images(images, work_dir)
+
+        with open(output_pdf_path, "wb") as f:
+            f.write(img2pdf.convert(clean_images))
+
+        return output_pdf_path
+    finally:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(work_dir, "_clean"), ignore_errors=True)

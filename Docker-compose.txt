@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  comic-bot:
+    build: .
+    container_name: comic-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      - ./output:/app/output
+      - ./data:/app/data

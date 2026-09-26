@@ -1,0 +1,6 @@
+pyrogram==2.0.106
+tgcrypto==1.2.5
+rarfile==4.2
+img2pdf==0.5.1
+Pillow==10.4.0
+python-dotenv==1.0.1

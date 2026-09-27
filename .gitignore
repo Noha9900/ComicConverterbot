@@ -1,0 +1,27 @@
+# Secrets and Credentials
+.env
+data/sessions.json
+
+# Pyrogram Sessions (Critical Security)
+*.session
+*.session-journal
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# Bot Specific Folders
+downloads/
+output/
+data/
+
+# Logs
+*.log
+bot.log

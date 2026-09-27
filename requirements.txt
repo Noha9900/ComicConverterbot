@@ -4,3 +4,8 @@ rarfile==4.2
 img2pdf==0.5.1
 Pillow==10.4.0
 python-dotenv==1.0.1
+pypdf==4.3.1
+ebooklib==0.18
+PyMuPDF==1.24.9
+aiohttp==3.10.5
+

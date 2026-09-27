@@ -25,6 +25,16 @@ RUN mkdir -p downloads output data
 
 ENV PYTHONUNBUFFERED=1
 
+# Real .cbr/.rar *output* (not extraction, which only needs unrar above)
+# requires the proprietary `rar` command-line tool, which isn't
+# redistributable in this image. Without it, CBR output automatically
+# falls back to a CBZ (ZIP) with the same pages -- every reader opens it
+# fine, only the compression/extension differs. To enable genuine RAR
+# output, install RARLab's `rar` binary into the image yourself and make
+# sure it's on PATH (config.py auto-detects it via shutil.which("rar")).
+
+EXPOSE 8080
+
 # No venv: dependencies are installed straight into the image's system
 # Python, so `docker run` starts the bot immediately with nothing else
 # to set up on the VPS.

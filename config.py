@@ -1,46 +1,71 @@
 """
-Central configuration for the CBZ/CBR -> PDF Telegram bot.
-All values are read from environment variables (see .env.example),
-so the same image/container works unmodified across VPS, Docker, and
+Central configuration for the comic-archive Telegram bot.
+All values are read from environment variables (see .env.example), so
+the same image/container works unmodified across VPS, Docker, and
 platforms like Koyeb / Railway / Render.
-
-No artificial caps are imposed here on queue size, batch size, or file
-count -- the only real ceilings are Telegram's own platform limits
-(2GB per file, 4096 chars per message), which live outside this bot's
-control entirely.
 """
 
 import os
+import shutil
 
 from dotenv import load_dotenv
 
 load_dotenv()  # no-op in production if you inject real env vars instead of a .env file
 
 # --- Telegram credentials -----------------------------------------------
-# API_ID / API_HASH come from https://my.telegram.org (required by Pyrogram
-# even for bots). BOT_TOKEN comes from @BotFather.
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# --- Filesystem -------------------------------------------------------------
+# --- Filesystem -----------------------------------------------------------
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
-# Where the persistent queue/session store lives, so a container restart
-# does not lose files a user already converted but hasn't renamed yet.
 DATA_DIR = os.getenv("DATA_DIR", "data")
 
-# --- Behaviour ----------------------------------------------------------------
-# How long (seconds) the bot waits for further volume parts of a
-# multi-volume .rar/.cbr archive before assuming the user is done
-# uploading and auto-finalizing. Users can also finalize immediately
-# with /convert. Set to 0 to disable auto-finalize and always require
-# /convert.
+# --- Behaviour --------------------------------------------------------------
 MULTIVOLUME_AUTO_FINALIZE_SECONDS = int(os.getenv("MULTIVOLUME_AUTO_FINALIZE_SECONDS", "20"))
-
-# How often (seconds) progress messages are allowed to be edited.
-# Telegram rate-limits frequent edits to the same message; 1.2-2.0s is safe.
 PROGRESS_EDIT_INTERVAL = float(os.getenv("PROGRESS_EDIT_INTERVAL", "1.5"))
+
+# Loose-image batches (for "multiple images -> CBZ/PDF/EPUB") use the same
+# idle-window auto-finalize idea as multi-volume RAR parts.
+IMAGE_BATCH_AUTO_FINALIZE_SECONDS = int(os.getenv("IMAGE_BATCH_AUTO_FINALIZE_SECONDS", "25"))
+
+# --- Admins / access control -------------------------------------------------
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
+
+# --- Auto-cleanup ("files only live 2 hours") --------------------------------
+FILE_TTL_HOURS = float(os.getenv("FILE_TTL_HOURS", "2"))
+CLEANUP_INTERVAL_MINUTES = float(os.getenv("CLEANUP_INTERVAL_MINUTES", "10"))
+
+# --- Rate limiting / quotas (admin-adjustable at runtime via /admin) --------
+DEFAULT_RATE_LIMIT_PER_MIN = int(os.getenv("DEFAULT_RATE_LIMIT_PER_MIN", "0"))  # 0 = unlimited
+DEFAULT_DAILY_QUOTA_MB = int(os.getenv("DEFAULT_DAILY_QUOTA_MB", "0"))  # 0 = unlimited
+
+# --- Misc UX -----------------------------------------------------------------
+FILE_SIZE_WARNING_MB = int(os.getenv("FILE_SIZE_WARNING_MB", "300"))
+DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "en")
+
+# --- Ops: health server, logging ---------------------------------------------
+ENABLE_HEALTH_SERVER = os.getenv("ENABLE_HEALTH_SERVER", "true").lower() == "true"
+HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "8080"))
+LOG_FILE = os.getenv("LOG_FILE", "")  # empty string = console-only logging
+
+# Pyrogram talks MTProto directly (a persistent socket), not the classic
+# Bot-API HTTP long-poll/webhook model, so there is no "push updates over
+# HTTP" mode to switch on here. What WEBHOOK_MODE actually enables is a
+# small aiohttp server (see webhook_server.py) that exposes /health and an
+# optional /notify endpoint another one of your systems can call to make
+# the bot push a message to a chat -- useful for external triggers, but it
+# is not Telegram-update delivery. See README for the full explanation.
+WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "false").lower() == "true"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# Real CBR archives are the proprietary RAR format. We can only *produce*
+# genuine .cbr/.rar output if a real `rar` command-line binary is present
+# on the host/image; otherwise "CBR output" silently falls back to a
+# .cbz (ZIP) with the same page contents, which every comic reader accepts
+# just as well for reading (only the file extension/compression differs).
+RAR_BINARY = shutil.which("rar")
 
 for _d in (DOWNLOAD_DIR, OUTPUT_DIR, DATA_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -57,4 +82,11 @@ def validate() -> None:
         raise RuntimeError(
             f"Missing required environment variable(s): {', '.join(missing)}. "
             "Set them in your .env file or in your host's environment settings."
+        )
+    if not ADMIN_IDS:
+        import logging
+
+        logging.getLogger("comic-bot").warning(
+            "ADMIN_IDS is empty -- no one will be able to use /admin or /stats. "
+            "Set ADMIN_IDS=<your numeric Telegram user id> in .env."
         )
